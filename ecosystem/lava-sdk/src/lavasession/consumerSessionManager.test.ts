@@ -483,19 +483,18 @@ describe("ConsumerSessionManager", () => {
         expect(consumerSession.session.relayNum).toEqual(
           RELAY_NUMBER_AFTER_FIRST_FAIL
         );
-        expect(cm.getAddedToPurgeAndReport()).toContain(
+
+        const rp = cm.getReportedProviders(FIRST_EPOCH_HEIGHT);
+        const allReported = [];
+        for (const r of rp) {
+          allReported.push(r.getAddress());
+        }
+        expect(allReported).toContain(
           consumerSession.session.client.publicLavaAddress
         );
         expect(cm.validAddresses).not.toContain(
           consumerSession.session.client.publicLavaAddress
         );
-
-        const reported = JSON.parse(
-          cm.getReportedProviders(FIRST_EPOCH_HEIGHT)
-        );
-        for (const providerReported of reported) {
-          expect(cm.getAddedToPurgeAndReport()).toContain(providerReported);
-        }
       }
     });
 
@@ -781,7 +780,7 @@ describe("ConsumerSessionManager", () => {
       const pairingList = createPairingList("", true);
       await cm.updateAllProviders(FIRST_EPOCH_HEIGHT, pairingList);
 
-      expect(cm.getEpoch()).toEqual(NUMBER_OF_PROVIDERS / 2);
+      expect(cm.getEpochFromEpochTracker()).toEqual(NUMBER_OF_PROVIDERS / 2);
     });
   });
 });

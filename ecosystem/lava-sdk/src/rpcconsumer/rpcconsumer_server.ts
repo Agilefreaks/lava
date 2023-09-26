@@ -57,6 +57,10 @@ export class RPCConsumerServer {
     this.finalizationConsensus = finalizationConsensus;
   }
 
+  public setChainParser(chainParser: BaseChainParser) {
+    this.chainParser = chainParser;
+  }
+
   public supportedChainAndApiInterface(): SupportedChainAndApiInterface {
     return {
       specId: this.rpcEndpoint.chainId,
@@ -102,7 +106,7 @@ export class RPCConsumerServer {
         errors.push(relayResult);
       } else {
         if (errors.length > 0) {
-          Logger.debug("relay succeeded but had some errors", ...errors);
+          Logger.warn("relay succeeded but had some errors", ...errors);
         }
         return relayResult;
       }

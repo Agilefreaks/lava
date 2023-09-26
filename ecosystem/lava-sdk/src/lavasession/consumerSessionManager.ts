@@ -32,9 +32,11 @@ import transport from "../util/browser";
 import { secondsToMillis } from "../util/time";
 import { sleep } from "../util/common";
 import { ProviderEpochTracker } from "./providerEpochTracker";
-
+import { APIInterfaceTendermintRPC } from "../chainlib/base_chain_parser";
 export const ALLOWED_PROBE_RETRIES = 3;
 export const TIMEOUT_BETWEEN_PROBES = secondsToMillis(1);
+import { ReportedProviders } from "./reported_providers";
+import { ReportedProvider } from "../grpc_web_services/lavanet/lava/pairing/relay_pb";
 
 export class ConsumerSessionManager {
   private rpcEndpoint: RPCEndpoint;
@@ -50,7 +52,7 @@ export class ConsumerSessionManager {
 
   public validAddresses: string[] = [];
   private addonAddresses: Map<string, string[]> = new Map<string, string[]>();
-  private addedToPurgeAndReport: Set<string> = new Set();
+  private reportedProviders: ReportedProviders = new ReportedProviders();
 
   private pairingPurge: Map<string, ConsumerSessionsWithProvider> = new Map<
     string,
@@ -81,7 +83,7 @@ export class ConsumerSessionManager {
     this.transport = opts?.transport ?? this.getTransport();
   }
 
-  public getEpoch(): number {
+  public getEpochFromEpochTracker(): number {
     return this.epochTracker.getEpoch();
   }
 
@@ -101,19 +103,20 @@ export class ConsumerSessionManager {
     return this.pairingAddresses.size;
   }
 
-  public getAddedToPurgeAndReport(): Set<string> {
-    return this.addedToPurgeAndReport;
-  }
-
   public async updateAllProviders(
     epoch: number,
     pairingList: ConsumerSessionsWithProvider[]
   ): Promise<Error | undefined> {
-    Logger.debug(
+    Logger.info(
       "updateAllProviders called. epoch:",
       epoch,
+      "this.currentEpoch",
+      this.currentEpoch,
       "Provider list length",
-      pairingList.length
+      pairingList.length,
+      "Api Inteface",
+      this.rpcEndpoint.apiInterface,
+      this.rpcEndpoint.chainId
     );
 
     if (epoch <= this.currentEpoch) {
@@ -122,21 +125,23 @@ export class ConsumerSessionManager {
       // For LAVA's initialization, we need to allow the pairing to be updated twice
       // This condition permits the pairing to be overwritten just once for the same epoch
       // After this one-time allowance, any attempt to overwrite will result in an error
-      if (
-        this.allowedUpdateForCurrentEpoch &&
-        epoch === this.currentEpoch &&
-        rpcEndpoint.chainId === "LAV1" &&
-        rpcEndpoint.apiInterface === "tendermintrpc"
-      ) {
-        this.allowedUpdateForCurrentEpoch = false;
-      } else {
-        Logger.error(
-          `trying to update provider list for older epoch ${JSON.stringify({
-            epoch,
-            currentEpoch: this.currentEpoch,
-          })}`
-        );
-        return new Error("Trying to update provider list for older epoch");
+      if (epoch != 0) {
+        if (
+          this.allowedUpdateForCurrentEpoch &&
+          epoch === this.currentEpoch &&
+          rpcEndpoint.chainId === "LAV1" &&
+          rpcEndpoint.apiInterface === APIInterfaceTendermintRPC
+        ) {
+          this.allowedUpdateForCurrentEpoch = false;
+        } else {
+          Logger.error(
+            `trying to update provider list for older epoch ${JSON.stringify({
+              epoch,
+              currentEpoch: this.currentEpoch,
+            })}`
+          );
+          return new Error("Trying to update provider list for older epoch");
+        }
       }
     }
     this.epochTracker.reset();
@@ -144,7 +149,7 @@ export class ConsumerSessionManager {
 
     // reset states
     this.pairingAddresses.clear();
-    this.addedToPurgeAndReport.clear();
+    this.reportedProviders.reset();
     this.numberOfResets = 0;
     this.removeAddonAddress();
     this.pairingPurge = this.pairing;
@@ -243,7 +248,7 @@ export class ConsumerSessionManager {
         if (endpointConn.error) {
           // if all provider endpoints are disabled, block and report provider
           if (endpointConn.error instanceof AllProviderEndpointsDisabledError) {
-            this.blockProvider(providerAddress, true, sessionEpoch);
+            this.blockProvider(providerAddress, true, sessionEpoch, 0, 1); // endpoints are disabled
           } else {
             // if any other error just throw it
             throw endpointConn.error;
@@ -257,7 +262,6 @@ export class ConsumerSessionManager {
           continue;
         }
 
-        const reportedProviders = this.getReportedProviders(sessionEpoch);
         const consumerSessionInstance =
           consumerSessionsWithProvider.getConsumerSessionInstanceFromEndpoint(
             endpointConn.endpoint,
@@ -269,7 +273,7 @@ export class ConsumerSessionManager {
           if (error instanceof MaximumNumberOfSessionsExceededError) {
             tempIgnoredProviders.providers.add(providerAddress);
           } else if (error instanceof MaximumNumberOfBlockListedSessionsError) {
-            this.blockProvider(providerAddress, false, sessionEpoch);
+            this.blockProvider(providerAddress, false, sessionEpoch, 0, 0);
           } else {
             throw error;
           }
@@ -279,7 +283,8 @@ export class ConsumerSessionManager {
 
         const { singleConsumerSession, pairingEpoch } = consumerSessionInstance;
 
-        if (pairingEpoch !== sessionEpoch) {
+        if (pairingEpoch !== sessionEpoch && pairingEpoch != 0) {
+          // if pairingEpoch == 0 its currently uninitialized so we keep the this.currentEpoch value
           Logger.error(
             `sessionEpoch and pairingEpoch mismatch sessionEpoch: ${sessionEpoch} pairingEpoch: ${pairingEpoch}`
           );
@@ -319,7 +324,7 @@ export class ConsumerSessionManager {
         sessions.set(providerAddress, {
           session: singleConsumerSession,
           epoch: sessionEpoch,
-          reportedProviders: reportedProviders,
+          reportedProviders: this.reportedProviders.GetReportedProviders(),
         });
 
         if (singleConsumerSession.relayNum > 1) {
@@ -333,7 +338,7 @@ export class ConsumerSessionManager {
 
         if (sessions.size === wantedSessions) {
           Logger.debug(
-            `returning sessions: ${JSON.stringify(sessions)}`,
+            `returning sessions: ${JSON.stringify(sessions.values())}`,
             sessions.size
           );
           return sessions;
@@ -449,7 +454,13 @@ export class ConsumerSessionManager {
     if (blockProvider) {
       const { publicProviderAddress, pairingEpoch } =
         parentConsumerSessionsWithProvider.getPublicLavaAddressAndPairingEpoch();
-      this.blockProvider(publicProviderAddress, reportProvider, pairingEpoch);
+      this.blockProvider(
+        publicProviderAddress,
+        reportProvider,
+        pairingEpoch,
+        1,
+        0
+      );
     }
   }
 
@@ -494,22 +505,21 @@ export class ConsumerSessionManager {
     }
   }
 
-  public getReportedProviders(epoch: number): string {
+  public getReportedProviders(epoch: number): Array<ReportedProvider> {
     if (epoch != this.currentEpoch) {
-      return "";
+      return new Array<ReportedProvider>();
     }
     // If the addedToPurgeAndReport is empty return empty string
     // because "[]" can not be parsed
-    if (this.addedToPurgeAndReport.size == 0) {
-      return "";
-    }
-    return JSON.stringify(Array.from(this.addedToPurgeAndReport));
+    return this.reportedProviders.GetReportedProviders();
   }
 
   private blockProvider(
     address: string,
     reportProvider: boolean,
-    sessionEpoch: number
+    sessionEpoch: number,
+    errors: number,
+    disconnections: number
   ): Error | undefined {
     if (sessionEpoch != this.currentEpoch) {
       return new EpochMismatchError();
@@ -522,7 +532,7 @@ export class ConsumerSessionManager {
 
     if (reportProvider) {
       Logger.info(`Reporting provider for unresponsiveness: ${address}`);
-      this.addedToPurgeAndReport.add(address);
+      this.reportedProviders.reportedProvider(address, errors, disconnections);
     }
   }
 
@@ -828,6 +838,7 @@ export class ConsumerSessionManager {
     retryProbing: Set<ConsumerSessionsWithProvider>
   ) {
     const startTime = performance.now();
+    const guid = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
     const promises = [];
     for (const endpoint of consumerSessionWithProvider.endpoints) {
       if (!endpoint.enabled) {
@@ -848,6 +859,7 @@ export class ConsumerSessionManager {
           .probeProvider(
             endpoint.networkAddress,
             this.getRpcEndpoint().apiInterface,
+            guid,
             this.getRpcEndpoint().chainId
           )
           .then((probeReply) => {
@@ -862,18 +874,31 @@ export class ConsumerSessionManager {
               latency + " ms"
             );
 
-            const lavaEpoch = probeReply.getLavaEpoch();
-            if (epoch == 0 && this.currentEpoch == 0) {
-              this.currentEpoch = lavaEpoch; // setting the epoch for initialization.
+            if (guid != probeReply.getGuid()) {
+              Logger.error(
+                "Guid mismatch for probe request and response. requested: ",
+                guid,
+                "response:",
+                probeReply.getGuid()
+              );
             }
+
+            const lavaEpoch = probeReply.getLavaEpoch();
             Logger.debug(
-              `Lava Epoch for provider ${consumerSessionWithProvider.publicLavaAddress}: ${lavaEpoch}`
+              `Probing Result for provider ${
+                consumerSessionWithProvider.publicLavaAddress
+              }, Epoch: ${lavaEpoch}, Lava Block: ${probeReply.getLavaLatestBlock()}`
             );
-            this.epochTracker.setLatestBlockFor(
+            this.epochTracker.setEpoch(
               consumerSessionWithProvider.publicLavaAddress,
               lavaEpoch
             );
-            consumerSessionWithProvider.setPairingEpoch(lavaEpoch); // set the pairing epoch on the specific provider.
+            // when epoch == 0 this is the initialization of the sdk. meaning we don't have information, we will take the median
+            // reported epoch from the providers probing and change the current epoch value as we probe more providers.
+            if (epoch == 0) {
+              this.currentEpoch = this.getEpochFromEpochTracker(); // setting the epoch for initialization.
+            }
+            consumerSessionWithProvider.setPairingEpoch(this.currentEpoch); // set the pairing epoch on the specific provider.
             this.providerOptimizer.appendProbeRelayData(
               consumerSessionWithProvider.publicLavaAddress,
               latency,
